@@ -11,6 +11,8 @@ Get up and running in 5 minutes!
    ollama pull llama3.2
    ```
 
+Note: The system uses **LangChain Community** for Ollama integration.
+
 ## Setup Steps
 
 ### 1. Install Dependencies

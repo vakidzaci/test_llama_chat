@@ -7,7 +7,7 @@ A multi-user codebase assistant built with RAG (Retrieval-Augmented Generation) 
 - **Backend**: FastAPI with authentication, rate limiting, and RAG endpoints
 - **Frontend**: Streamlit UI for user interaction
 - **Vector DB**: Chroma (single shared collection for all users)
-- **LLM**: Ollama (for embeddings and chat)
+- **LLM Integration**: Ollama via LangChain Community (for embeddings and chat)
 - **User DB**: SQLite with hashed passwords and API keys
 
 ## ✨ Features
@@ -19,6 +19,7 @@ A multi-user codebase assistant built with RAG (Retrieval-Augmented Generation) 
 - ✅ Line-based chunking with overlap
 - ✅ Source citation with file paths and line ranges
 - ✅ Configurable via environment variables
+- ✅ **LangChain Community integration** for robust LLM/vector store operations
 
 ## 📋 Prerequisites
 
@@ -336,6 +337,19 @@ for source in result["sources"]:
 ```
 
 ## 🔧 Development
+
+### LangChain Integration
+
+This system uses **LangChain Community** for:
+- **OllamaEmbeddings**: Generates embeddings for queries and documents
+- **ChatOllama**: Handles chat completions with context-aware responses
+- **Chroma Vectorstore**: Manages vector storage and similarity search
+
+Benefits:
+- Cleaner abstractions over raw API calls
+- Better error handling and retries
+- Standardized interfaces across LLM providers
+- Easy to swap providers (e.g., OpenAI, Anthropic) by changing components
 
 ### Running with Auto-Reload
 ```bash

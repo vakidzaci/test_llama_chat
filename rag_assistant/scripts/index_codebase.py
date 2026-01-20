@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Index a Python codebase into Chroma vector database.
+Index a Python codebase into Chroma vector database using LangChain.
 
 Usage:
     python scripts/index_codebase.py /path/to/repo
@@ -10,8 +10,11 @@ import argparse
 import hashlib
 import sys
 from pathlib import Path
-from typing import List, Dict, Tuple
-import requests
+from typing import List, Dict
+
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
 import chromadb
 
 # Add parent directory to path for config import
@@ -86,37 +89,8 @@ def chunk_file(file_path: Path, repo_root: Path) -> List[Dict]:
     return chunks
 
 
-def get_ollama_embedding(text: str) -> List[float]:
-    """Get embedding from Ollama API."""
-    url = f"{config.OLLAMA_BASE_URL}/api/embed"
-    payload = {
-        "model": config.OLLAMA_EMBED_MODEL,
-        "input": text
-    }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=config.OLLAMA_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Response shape: {"embeddings": [[...]], ...}
-        # We want the first embedding
-        if "embeddings" in data and len(data["embeddings"]) > 0:
-            return data["embeddings"][0]
-        elif "embedding" in data:
-            return data["embedding"]
-        else:
-            raise ValueError(f"Unexpected response format: {data.keys()}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Ollama embedding API: {e}")
-        raise
-    except Exception as e:
-        print(f"Error processing embedding response: {e}")
-        raise
-
-
 def index_repository(repo_path: str, reset: bool = False):
-    """Main indexing function."""
+    """Main indexing function using LangChain."""
     repo_path = Path(repo_path).resolve()
     
     if not repo_path.exists():
@@ -131,24 +105,21 @@ def index_repository(repo_path: str, reset: bool = False):
     print(f"Chroma persist dir: {config.CHROMA_PERSIST_DIR}")
     print(f"Collection name: {config.CHROMA_COLLECTION}")
     
-    # Initialize Chroma client
-    client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
+    # Initialize LangChain embeddings
+    embeddings = OllamaEmbeddings(
+        model=config.OLLAMA_EMBED_MODEL,
+        base_url=config.OLLAMA_BASE_URL
+    )
     
+    # Handle reset if requested
     if reset:
         print("Reset flag detected. Deleting existing collection...")
         try:
+            client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
             client.delete_collection(name=config.CHROMA_COLLECTION)
             print("Collection deleted.")
         except Exception as e:
             print(f"Note: Could not delete collection (might not exist): {e}")
-    
-    # Get or create collection
-    collection = client.get_or_create_collection(
-        name=config.CHROMA_COLLECTION,
-        metadata={"hnsw:space": "cosine"}
-    )
-    
-    print(f"Collection '{config.CHROMA_COLLECTION}' ready.")
     
     # Find all Python files
     python_files = get_python_files(repo_path)
@@ -170,46 +141,53 @@ def index_repository(repo_path: str, reset: bool = False):
         print("Warning: No chunks created!")
         return
     
-    # Generate embeddings and add to collection
-    print("Generating embeddings and adding to collection...")
+    # Convert chunks to LangChain Documents
+    print("Converting chunks to LangChain Documents...")
+    documents = []
+    for chunk in all_chunks:
+        doc = Document(
+            page_content=chunk["chunk_text"],
+            metadata={
+                "file_path": chunk["file_path"],
+                "start_line": chunk["start_line"],
+                "end_line": chunk["end_line"],
+                "chunk_id": chunk["chunk_id"]
+            }
+        )
+        documents.append(doc)
     
+    # Create or update Chroma vectorstore using LangChain
+    print("Creating embeddings and indexing into Chroma (this may take a while)...")
+    
+    # Process in batches for progress feedback
     batch_size = 50
-    for i in range(0, len(all_chunks), batch_size):
-        batch = all_chunks[i:i+batch_size]
+    total_batches = (len(documents) + batch_size - 1) // batch_size
+    
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i:i+batch_size]
+        batch_num = i // batch_size + 1
         
-        documents = []
-        embeddings = []
-        metadatas = []
-        ids = []
+        print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} documents)...")
         
-        for chunk in batch:
-            # Get embedding
-            try:
-                embedding = get_ollama_embedding(chunk["chunk_text"])
-                
-                documents.append(chunk["chunk_text"])
-                embeddings.append(embedding)
-                metadatas.append({
-                    "file_path": chunk["file_path"],
-                    "start_line": chunk["start_line"],
-                    "end_line": chunk["end_line"]
-                })
-                ids.append(chunk["chunk_id"])
-            except Exception as e:
-                print(f"Error processing chunk {chunk['chunk_id']}: {e}")
-                continue
-        
-        if documents:
-            # Upsert to handle duplicates
-            collection.upsert(
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                ids=ids
+        if i == 0:
+            # Create vectorstore with first batch
+            vectorstore = Chroma.from_documents(
+                documents=batch,
+                embedding=embeddings,
+                collection_name=config.CHROMA_COLLECTION,
+                persist_directory=config.CHROMA_PERSIST_DIR,
+                ids=[doc.metadata["chunk_id"] for doc in batch]
             )
-            print(f"  Processed batch {i//batch_size + 1}: {len(documents)} chunks")
+        else:
+            # Add subsequent batches
+            vectorstore.add_documents(
+                documents=batch,
+                ids=[doc.metadata["chunk_id"] for doc in batch]
+            )
     
     # Verify
+    client = chromadb.PersistentClient(path=config.CHROMA_PERSIST_DIR)
+    collection = client.get_collection(name=config.CHROMA_COLLECTION)
     count = collection.count()
     print(f"\n✅ Indexing complete! Total chunks in collection: {count}")
     

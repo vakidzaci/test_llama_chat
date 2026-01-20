@@ -23,7 +23,10 @@ def test_imports():
         "dotenv",
         "bcrypt",
         "requests",
-        "pydantic"
+        "pydantic",
+        "langchain",
+        "langchain_community",
+        "langchain_core"
     ]
     
     failed = []

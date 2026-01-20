@@ -25,7 +25,7 @@ A complete, production-ready multi-user RAG (Retrieval-Augmented Generation) sys
 - 🏗️ FastAPI backend with async support
 - 🎨 Streamlit UI for easy interaction
 - 💾 Chroma vector database (persistent)
-- 🤖 Ollama for embeddings + chat
+- 🤖 Ollama for embeddings + chat via **LangChain Community**
 - 📦 SQLite for user management
 - ⚙️ Environment-based configuration
 
@@ -187,6 +187,55 @@ python scripts/index_codebase.py /path/to/repo --reset  # Wipe and reindex
 - `api_key`: User's authentication token
 - `username`: Current user
 - `query_history`: Past queries and results
+
+## 🔗 LangChain Integration
+
+This project uses **LangChain Community** for LLM and vector store operations, providing:
+
+### Components Used
+
+1. **OllamaEmbeddings** (`langchain_community.embeddings.OllamaEmbeddings`)
+   - Generates embeddings for queries and documents
+   - Automatically handles API calls to Ollama
+   - Supports batching and error handling
+
+2. **ChatOllama** (`langchain_community.chat_models.ChatOllama`)
+   - Manages chat completions with Ollama
+   - Uses LangChain's message format (SystemMessage, HumanMessage)
+   - Provides consistent interface across LLM providers
+
+3. **Chroma Vectorstore** (`langchain_community.vectorstores.Chroma`)
+   - High-level abstraction over Chroma client
+   - Handles document indexing with `from_documents()`
+   - Provides `similarity_search_with_score()` for retrieval
+
+### Benefits of LangChain
+
+- **Abstraction**: Clean interfaces over raw API calls
+- **Error Handling**: Built-in retry logic and error management
+- **Standardization**: Consistent patterns across different providers
+- **Extensibility**: Easy to swap Ollama for OpenAI, Anthropic, etc.
+- **Document Management**: Unified Document class for metadata handling
+- **Community Support**: Well-maintained integrations and documentation
+
+### Migration Path
+
+To switch from Ollama to another provider:
+
+```python
+# From Ollama
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.chat_models import ChatOllama
+
+# To OpenAI (example)
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+# Just replace the initialization
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+chat_model = ChatOpenAI(model="gpt-4")
+```
+
+The rest of the code remains unchanged!
 
 ## ⚙️ Configuration
 
