@@ -154,24 +154,24 @@ async def query_rag(
 ):
     """
     Query the codebase using RAG.
-
+    
     Headers:
         X-API-Key: Your API key from registration/login
-
+    
     Body:
         question: Your question about the codebase
         top_k: Optional number of chunks to retrieve (default: 5)
     """
     # Verify API key
     user_info = verify_api_key_header(x_api_key)
-
+    
     # Check rate limit
     check_rate_limit(user_info)
-
+    
     # Perform RAG query
     try:
         result = rag_service.query(request.question, request.top_k)
-
+        
         sources = [
             SourceInfo(
                 file_path=s["file_path"],
@@ -181,12 +181,12 @@ async def query_rag(
             )
             for s in result["sources"]
         ]
-
+        
         return QueryResponse(
             answer=result["answer"],
             sources=sources
         )
-
+    
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

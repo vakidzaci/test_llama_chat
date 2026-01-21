@@ -58,8 +58,8 @@ Default configuration:
 - Embed model: `nomic-embed-text`
 - Chat model: `llama3.2`
 - Rate limit: 20 requests/minute
-- Top-K chunks: 5
-- Max context: 8000 characters
+- Top-K chunks: 3 (reduced for better context management)
+- Max context: 4000 characters (safer for most models)
 
 ### 3. Index a Codebase
 
@@ -212,8 +212,8 @@ OLLAMA_EMBED_MODEL=nomic-embed-text
 OLLAMA_CHAT_MODEL=llama3.2
 
 # RAG
-TOP_K_DEFAULT=5
-MAX_CONTEXT_CHARS=8000
+TOP_K_DEFAULT=3
+MAX_CONTEXT_CHARS=4000
 CHUNK_SIZE_LINES=150
 OVERLAP_LINES=30
 

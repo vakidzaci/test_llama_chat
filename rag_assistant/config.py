@@ -37,8 +37,8 @@ OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
 
 # RAG Configuration
-TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "5"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "8000"))
+TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "3"))  # Reduced from 5 to avoid context overflow
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "4000"))  # Reduced from 8000 for safer context limits
 CHUNK_SIZE_LINES = int(os.getenv("CHUNK_SIZE_LINES", "150"))
 OVERLAP_LINES = int(os.getenv("OVERLAP_LINES", "30"))
 
