@@ -1,11 +1,11 @@
 """
-RPA Bot Code Reviewer - Reads files directly, uses ChromaDB for context search
+RPA Bot Code Reviewer - Updated with VectorStore and bot_collection usage
 """
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
 from dataclasses import dataclass
-import chromadb
+from langchain_community.vectorstores import Chroma
 from langchain_community.llms import Ollama
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain.prompts import PromptTemplate
@@ -19,8 +19,7 @@ class ReviewConfig:
     codebase_path: str  # Path to reference codebase folder
 
     # ChromaDB settings
-    chromadb_host: str = "localhost"
-    chromadb_port: int = 8000
+    persist_dir: str = "./chroma_db"
     bot_collection_name: str = "bot"
     codebase_collection_name: str = "codebase"
 
@@ -82,31 +81,35 @@ class RPABotReviewer:
         self.codebase_path = Path(config.codebase_path)
 
         # Initialize Ollama LLM
+        print(f"🤖 Initializing LLM: {config.chat_model}")
         self.llm = Ollama(
             model=config.chat_model,
             base_url=config.ollama_host
         )
 
+        # Initialize embeddings
+        print(f"🔧 Initializing embeddings: {config.embed_model}")
         self.embeddings = OllamaEmbeddings(
             model=config.embed_model,
             base_url=config.ollama_host
         )
 
-        # Initialize ChromaDB client
-        print(f"🔌 Connecting to ChromaDB at {config.chromadb_host}:{config.chromadb_port}")
-        self.chroma_client = chromadb.HttpClient(
-            host=config.chromadb_host,
-            port=config.chromadb_port
+        # Initialize VectorStores instead of raw ChromaDB
+        print(f"📚 Loading bot vectorstore from {config.persist_dir}")
+        self.bot_vectorstore = Chroma(
+            collection_name=config.bot_collection_name,
+            embedding_function=self.embeddings,
+            persist_directory=config.persist_dir
         )
+        print(f"   - Bot collection loaded")
 
-        # Get ChromaDB collections
-        print(f"📚 Loading collection: {config.bot_collection_name}")
-        self.bot_collection = self.chroma_client.get_collection(config.bot_collection_name)
-        print(f"   - Bot collection has {self.bot_collection.count()} items")
-
-        print(f"📚 Loading collection: {config.codebase_collection_name}")
-        self.codebase_collection = self.chroma_client.get_collection(config.codebase_collection_name)
-        print(f"   - Codebase collection has {self.codebase_collection.count()} items\n")
+        print(f"📚 Loading codebase vectorstore from {config.persist_dir}")
+        self.codebase_vectorstore = Chroma(
+            collection_name=config.codebase_collection_name,
+            embedding_function=self.embeddings,
+            persist_directory=config.persist_dir
+        )
+        print(f"   - Codebase collection loaded\n")
 
         self.context_manager = ContextManager(config.max_context_tokens)
 
@@ -125,16 +128,22 @@ class RPABotReviewer:
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
 
-    def _search_context(self, collection, query: str, n_results: int = None) -> List[str]:
-        """Use ChromaDB for vector search to get relevant context"""
-        n_results = n_results or self.config.top_k_results
+    def _search_context(self, vectorstore, query: str, k: int = None, filter_dict: Dict = None) -> List[str]:
+        """Use VectorStore similarity_search instead of raw ChromaDB query"""
+        k = k or self.config.top_k_results
 
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results
-        )
+        try:
+            # Returns Document objects
+            if filter_dict:
+                docs = vectorstore.similarity_search(query, k=k, filter=filter_dict)
+            else:
+                docs = vectorstore.similarity_search(query, k=k)
 
-        return results['documents'][0] if results['documents'] else []
+            # Extract text content
+            return [doc.page_content for doc in docs]
+        except Exception as e:
+            print(f"⚠️  Search warning: {e}")
+            return []
 
     def review_robot_py(self) -> Dict[str, str]:
         """Step 1: Review robot.py for workflow and layout"""
@@ -143,36 +152,49 @@ class RPABotReviewer:
         # Read file directly
         robot_content = self._read_file("robot.py")
 
-        # Get relevant context from ChromaDB about workflow patterns
-        workflow_context = self._search_context(
-            self.codebase_collection,
-            "workflow orchestration celery tasks error handling patterns"
+        # Search CODEBASE for workflow best practices
+        workflow_patterns = self._search_context(
+            self.codebase_vectorstore,
+            "workflow orchestration celery tasks error handling patterns best practices"
+        )
+
+        # Search BOT for step definitions to understand available steps
+        available_steps = self._search_context(
+            self.bot_vectorstore,
+            "def step function steps.py implementation",
+            k=10
         )
 
         prompt = PromptTemplate(
             template="""You are an expert RPA code reviewer.
 Review this robot.py file which contains the workflow orchestration.
 
-BEST PRACTICES FROM CODEBASE:
-{context}
+WORKFLOW BEST PRACTICES FROM CODEBASE:
+{workflow_patterns}
+
+AVAILABLE STEPS IN THIS BOT:
+{available_steps}
 
 FILE: robot.py
 {content}
 
 Provide a review covering:
 1. Workflow structure and organization
-2. Potential risks (error handling, race conditions, resource management)
-3. Use of control flow (if/while/for)
-4. State management practices
-5. Celery task configuration
+2. Are all called steps actually defined?
+3. Potential risks (error handling, race conditions, resource management)
+4. Use of control flow (if/while/for)
+5. State management practices
+6. Celery task configuration
+7. Are there any orphaned/unused workflow sections?
 
 Keep the review concise and focused on issues.
 """,
-            input_variables=["context", "content"]
+            input_variables=["workflow_patterns", "available_steps", "content"]
         )
 
         review = self.llm.invoke(prompt.format(
-            context="\n".join(workflow_context[:3]),
+            workflow_patterns="\n---\n".join(workflow_patterns[:3]),
+            available_steps="\n---\n".join(available_steps[:5]),
             content=robot_content[:8000]
         ))
 
@@ -199,27 +221,43 @@ Keep the review concise and focused on issues.
         step_reviews = []
 
         for step in steps:
-            # Use ChromaDB to find relevant patterns from codebase
-            pattern_query = f"business logic {step['name']} error handling validation"
+            print(f"  Reviewing step: {step['name']}...", end=" ")
+
+            # 1. Search CODEBASE for best practices
             codebase_patterns = self._search_context(
-                self.codebase_collection,
-                pattern_query,
-                n_results=3
+                self.codebase_vectorstore,
+                f"business logic step {step['name']} error handling validation best practices",
+                k=3
             )
 
-            # Check for code duplication using vector search
-            duplication_query = step['code'][:500]  # Use actual code for similarity search
-            similar_code = self._search_context(
-                self.codebase_collection,
-                duplication_query,
-                n_results=2
+            # 2. Search BOT for where this step is used in robot.py
+            step_usage = self._search_context(
+                self.bot_vectorstore,
+                f"{step['name']} called invoke workflow robot.py usage",
+                k=3
+            )
+
+            # 3. Search BOT for similar code (internal duplication within bot)
+            internal_duplication = self._search_context(
+                self.bot_vectorstore,
+                step['code'][:500],
+                k=3
+            )
+
+            # 4. Search CODEBASE for similar code (external duplication)
+            external_duplication = self._search_context(
+                self.codebase_vectorstore,
+                step['code'][:500],
+                k=2
             )
 
             review = self._review_single_step(
                 step,
                 self.context_manager.get_context(),
                 codebase_patterns,
-                similar_code
+                step_usage,
+                internal_duplication,
+                external_duplication
             )
 
             # Only include if there are issues
@@ -229,6 +267,9 @@ Keep the review concise and focused on issues.
                     "line_number": step['line'],
                     "review": review
                 })
+                print("⚠️  Issues found")
+            else:
+                print("✅")
 
         # Update context with summary
         summary = f"steps.py: {len(steps)} steps reviewed, {len(step_reviews)} with issues"
@@ -241,7 +282,10 @@ Keep the review concise and focused on issues.
         }
 
     def _review_single_step(self, step: Dict, context: str,
-                            patterns: List[str], similar_code: List[str]) -> str:
+                           codebase_patterns: List[str],
+                           step_usage: List[str],
+                           internal_dup: List[str],
+                           external_dup: List[str]) -> str:
         """Review a single step function"""
         prompt = PromptTemplate(
             template="""You are reviewing a step function in an RPA bot.
@@ -249,11 +293,17 @@ Keep the review concise and focused on issues.
 CONTEXT FROM PREVIOUS ANALYSIS:
 {context}
 
-BEST PRACTICES PATTERNS:
-{patterns}
+BEST PRACTICES FROM CODEBASE:
+{codebase_patterns}
 
-SIMILAR CODE IN CODEBASE (check for duplication):
-{similar}
+WHERE THIS STEP IS USED IN THE BOT:
+{step_usage}
+
+SIMILAR CODE IN THIS BOT (check for internal duplication):
+{internal_dup}
+
+SIMILAR CODE IN CODEBASE (check if better version exists):
+{external_dup}
 
 STEP TO REVIEW:
 Function: {name}
@@ -262,21 +312,26 @@ Code:
 {code}
 
 Review for:
-1. Business logic correctness
-2. Error handling and validation
-3. State management
-4. Code duplication (if similar code exists in codebase, suggest using it)
-5. Data validation and type checking
+1. Is this step actually called in the workflow? (check usage above)
+2. Is it duplicated elsewhere in THIS bot? (internal duplication)
+3. Does better code exist in the codebase? (external duplication)
+4. Business logic correctness
+5. Error handling and validation
+6. State management
+7. Data validation and type checking
 
 Only report if there are actual issues. Be concise.
 """,
-            input_variables=["context", "patterns", "similar", "name", "line", "code"]
+            input_variables=["context", "codebase_patterns", "step_usage",
+                           "internal_dup", "external_dup", "name", "line", "code"]
         )
 
         review = self.llm.invoke(prompt.format(
-            context=context[:1000],
-            patterns="\n---\n".join(patterns),
-            similar="\n---\n".join(similar_code),
+            context=context[:800],
+            codebase_patterns="\n---\n".join(codebase_patterns[:2]) if codebase_patterns else "None found",
+            step_usage="\n---\n".join(step_usage[:2]) if step_usage else "⚠️ No usage found - possibly orphaned code",
+            internal_dup="\n---\n".join([d for d in internal_dup if step['name'] not in d][:2]) if internal_dup else "None",
+            external_dup="\n---\n".join(external_dup[:2]) if external_dup else "None",
             name=step['name'],
             line=step['line'],
             code=step['code'][:2000]
@@ -302,27 +357,43 @@ Only report if there are actual issues. Be concise.
         reviews = []
 
         for block in code_blocks:
-            # Search for technical standards from codebase
-            tech_query = f"{block['type']} {block['name']} security error handling logging"
+            print(f"  Reviewing {block['type']}: {block['name']}...", end=" ")
+
+            # 1. Search CODEBASE for technical standards
             tech_standards = self._search_context(
-                self.codebase_collection,
-                tech_query,
-                n_results=3
+                self.codebase_vectorstore,
+                f"{block['type']} {block['name']} security error handling logging resource management",
+                k=3
             )
 
-            # Check for code duplication
-            dup_query = block['code'][:500]
-            similar_code = self._search_context(
-                self.codebase_collection,
-                dup_query,
-                n_results=2
+            # 2. Search BOT for where this utility is used
+            util_usage = self._search_context(
+                self.bot_vectorstore,
+                f"{block['name']} import from utils usage called",
+                k=3
+            )
+
+            # 3. Search BOT for internal duplication
+            internal_duplication = self._search_context(
+                self.bot_vectorstore,
+                block['code'][:500],
+                k=3
+            )
+
+            # 4. Search CODEBASE for external duplication
+            external_duplication = self._search_context(
+                self.codebase_vectorstore,
+                block['code'][:500],
+                k=2
             )
 
             review = self._review_util_block(
                 block,
                 self.context_manager.get_context(),
                 tech_standards,
-                similar_code
+                util_usage,
+                internal_duplication,
+                external_duplication
             )
 
             if self._has_issues(review):
@@ -332,6 +403,9 @@ Only report if there are actual issues. Be concise.
                     "line_number": block['line'],
                     "review": review
                 })
+                print("⚠️  Issues found")
+            else:
+                print("✅")
 
         return {
             "file": filename,
@@ -340,7 +414,10 @@ Only report if there are actual issues. Be concise.
         }
 
     def _review_util_block(self, block: Dict, context: str,
-                           standards: List[str], similar_code: List[str]) -> str:
+                          tech_standards: List[str],
+                          util_usage: List[str],
+                          internal_dup: List[str],
+                          external_dup: List[str]) -> str:
         """Review a utility function or class"""
         prompt = PromptTemplate(
             template="""You are reviewing technical utility code in an RPA bot.
@@ -349,10 +426,16 @@ CONTEXT:
 {context}
 
 TECHNICAL STANDARDS FROM CODEBASE:
-{standards}
+{tech_standards}
 
-SIMILAR CODE (check for duplication):
-{similar}
+WHERE THIS UTILITY IS USED IN THE BOT:
+{util_usage}
+
+SIMILAR CODE IN THIS BOT (check for internal duplication):
+{internal_dup}
+
+SIMILAR CODE IN CODEBASE (check if better version exists):
+{external_dup}
 
 CODE TO REVIEW:
 Type: {type}
@@ -362,23 +445,28 @@ Code:
 {code}
 
 Review for:
-1. Error handling and logging
-2. Resource management (DB connections, files, browser sessions)
-3. Security (credentials, SQL injection, XSS)
-4. Code reusability and duplication
-5. Performance and efficiency
-6. Type hints and documentation
-7. PostgreSQL query safety
+1. Is this utility actually used? (check usage above)
+2. Is it duplicated elsewhere in THIS bot?
+3. Does better code exist in the codebase?
+4. Error handling and logging
+5. Resource management (DB connections, files, browser sessions)
+6. Security (credentials, SQL injection, XSS)
+7. Performance and efficiency
+8. Type hints and documentation
+9. PostgreSQL query safety
 
 Focus on technical standards. Be concise, report only issues.
 """,
-            input_variables=["context", "standards", "similar", "type", "name", "line", "code"]
+            input_variables=["context", "tech_standards", "util_usage",
+                           "internal_dup", "external_dup", "type", "name", "line", "code"]
         )
 
         review = self.llm.invoke(prompt.format(
             context=context[:800],
-            standards="\n---\n".join(standards),
-            similar="\n---\n".join(similar_code),
+            tech_standards="\n---\n".join(tech_standards[:2]) if tech_standards else "None found",
+            util_usage="\n---\n".join(util_usage[:2]) if util_usage else "⚠️ No usage found - possibly orphaned code",
+            internal_dup="\n---\n".join([d for d in internal_dup if block['name'] not in d][:2]) if internal_dup else "None",
+            external_dup="\n---\n".join(external_dup[:2]) if external_dup else "None",
             type=block['type'],
             name=block['name'],
             line=block['line'],
@@ -448,12 +536,13 @@ Focus on technical standards. Be concise, report only issues.
         issue_keywords = [
             'risk', 'issue', 'problem', 'error', 'missing', 'incorrect',
             'vulnerability', 'duplication', 'repeated', 'security',
-            'should', 'must', 'need to', 'warning', 'concern', 'duplicate'
+            'should', 'must', 'need to', 'warning', 'concern', 'duplicate',
+            'orphaned', 'unused', 'not found', 'no usage'
         ]
         return any(keyword in review_lower for keyword in issue_keywords)
 
     def generate_final_report(self, robot_review: Dict,
-                              steps_review: Dict, utils_review: Dict) -> str:
+                             steps_review: Dict, utils_review: Dict) -> str:
         """Generate consolidated final report"""
         print("📝 Generating final report...")
 
@@ -471,14 +560,19 @@ UTILS.PY REVIEWS ({utils_count} issues found out of {utils_total} blocks):
 
 Create a summary with:
 1. Executive summary (3-4 sentences)
-2. Critical issues (with file, function/class name, line numbers)
+2. Critical issues by priority:
+   - Security vulnerabilities
+   - Orphaned/unused code
+   - Code duplication (internal and external)
+   - Missing error handling
+   - Other issues
 3. Recommendations prioritized by severity
 4. Statistics (total issues, by category)
 
-Be concise and actionable.
+Be concise and actionable. Include file names, function/class names, and line numbers.
 """,
             input_variables=["robot", "steps", "steps_count", "steps_total",
-                             "utils", "utils_count", "utils_total"]
+                           "utils", "utils_count", "utils_total"]
         )
 
         steps_summary = "\n".join([
@@ -508,42 +602,31 @@ def main():
     """Main execution flow"""
 
     # ========================================
-    # CONFIGURATION - UPDATE THESE PATHS
+    # CONFIGURATION
     # ========================================
     config = ReviewConfig(
-        # Bot code filesystem path
-        bot_path="./rpa_bot",
-
-        # Reference codebase filesystem path
-        codebase_path="./rpa_codebase",
-
-        # ChromaDB connection (where your collections are)
-        chromadb_host="localhost",
-        chromadb_port=8000,
+        bot_path="./rpa_bot",           # Path to your bot code
+        codebase_path="./rpa_codebase", # Path to reference codebase
+        persist_dir="./chroma_db",      # ChromaDB storage location
         bot_collection_name="bot",
         codebase_collection_name="codebase",
-
-        # Ollama connection
         ollama_host="http://localhost:11434",
         chat_model="py-chat",
         embed_model="py-embed"
     )
 
     print("🤖 Starting RPA Bot Code Review")
-    print(f"📁 Bot filesystem path: {config.bot_path}")
-    print(f"📁 Codebase filesystem path: {config.codebase_path}")
-    print(f"🗄️  ChromaDB: {config.chromadb_host}:{config.chromadb_port}")
-    print(f"🗄️  Bot collection: '{config.bot_collection_name}'")
-    print(f"🗄️  Codebase collection: '{config.codebase_collection_name}'\n")
+    print(f"📁 Bot path: {config.bot_path}")
+    print(f"📁 Codebase path: {config.codebase_path}")
+    print(f"💾 ChromaDB persist: {config.persist_dir}\n")
 
     try:
         reviewer = RPABotReviewer(config)
     except Exception as e:
-        print(f"❌ Error connecting to ChromaDB: {e}")
+        print(f"❌ Error initializing reviewer: {e}")
         print("\nMake sure:")
-        print("1. ChromaDB server is running")
-        print("2. Collections 'bot' and 'codebase' exist")
-        print("3. Host and port are correct")
+        print("1. ChromaDB collections exist in ./chroma_db")
+        print("2. Ollama is running with py-chat and py-embed models")
         return
 
     # Step 1: Review robot.py
@@ -561,15 +644,16 @@ def main():
     )
 
     # Display and save
-    print("\n" + "=" * 80)
+    print("\n" + "="*80)
     print("FINAL REPORT")
-    print("=" * 80)
+    print("="*80)
     print(final_report)
 
     # Save to file
     with open("rpa_bot_review.md", "w") as f:
         f.write(f"# RPA Bot Code Review\n\n")
-        f.write(f"**Bot Path:** {config.bot_path}\n\n")
+        f.write(f"**Bot Path:** {config.bot_path}\n")
+        f.write(f"**Codebase Path:** {config.codebase_path}\n\n")
 
         f.write(f"## 1. robot.py Review\n\n{robot_review['review']}\n\n")
 
