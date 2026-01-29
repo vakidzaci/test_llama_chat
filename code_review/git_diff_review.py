@@ -1,6 +1,7 @@
 """
-MR-Focused Code Reviewer - Reviews only git diff changes
-Old code from ChromaDB, new code from filesystem
+Review uncommitted changes on current branch
+Compares working directory vs HEAD (last commit)
+Old code from ChromaDB, new code from working directory
 """
 import subprocess
 import re
@@ -16,7 +17,7 @@ from langchain.prompts import PromptTemplate
 
 @dataclass
 class ReviewConfig:
-    """Configuration for MR reviewer"""
+    """Configuration for diff reviewer"""
     bot_path: str = "./rpa_bot"
     persist_dir: str = "./chroma_db"
     bot_collection_name: str = "bot"
@@ -24,8 +25,6 @@ class ReviewConfig:
     ollama_host: str = "http://localhost:11434"
     chat_model: str = "py-chat"
     embed_model: str = "py-embed"
-    base_branch: str = "main"
-    compare_branch: str = "HEAD"
 
 
 @dataclass
@@ -41,20 +40,15 @@ class ChangedFunction:
 
 
 class GitDiffParser:
-    """Parse git diff to extract changed files and line ranges"""
+    """Parse git diff for current working directory changes"""
 
-    def __init__(self, base_branch: str, compare_branch: str, repo_path: str):
-        self.base_branch = base_branch
-        self.compare_branch = compare_branch
+    def __init__(self, repo_path: str):
         self.repo_path = Path(repo_path)
 
     def get_changed_files(self) -> List[str]:
-        """Get list of changed Python files"""
-        cmd = [
-            "git", "diff",
-            "--name-only",
-            f"{self.base_branch}...{self.compare_branch}"
-        ]
+        """Get list of changed Python files in working directory"""
+        # Git diff for uncommitted changes
+        cmd = ["git", "diff", "--name-only", "HEAD"]
 
         result = subprocess.run(
             cmd,
@@ -65,14 +59,15 @@ class GitDiffParser:
 
         files = result.stdout.strip().split('\n')
         # Filter only Python files
-        return [f for f in files if f.endswith('.py')]
+        return [f for f in files if f.endswith('.py') and f]
 
     def get_changed_line_ranges(self, file_path: str) -> List[Tuple[int, int]]:
         """Get changed line ranges for a file"""
+        # Compare working directory vs HEAD
         cmd = [
             "git", "diff",
             "--unified=0",  # No context lines
-            f"{self.base_branch}...{self.compare_branch}",
+            "HEAD",
             "--", file_path
         ]
 
@@ -85,7 +80,6 @@ class GitDiffParser:
 
         ranges = []
         # Parse diff output for line ranges
-        # Format: @@ -old_start,old_count +new_start,new_count @@
         for line in result.stdout.split('\n'):
             if line.startswith('@@'):
                 match = re.search(r'\+(\d+)(?:,(\d+))?', line)
@@ -96,6 +90,21 @@ class GitDiffParser:
                     ranges.append((start, end))
 
         return ranges
+
+    def get_old_file_content(self, file_path: str) -> Optional[str]:
+        """Get file content from HEAD (last commit)"""
+        cmd = ["git", "show", f"HEAD:{file_path}"]
+
+        result = subprocess.run(
+            cmd,
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            return result.stdout
+        return None
 
 
 class CodeParser:
@@ -113,7 +122,6 @@ class CodeParser:
 
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
-                # Get function code
                 func_lines = code.split('\n')[node.lineno - 1:node.end_lineno]
                 func_code = '\n'.join(func_lines)
 
@@ -125,7 +133,6 @@ class CodeParser:
                 })
 
             elif isinstance(node, ast.ClassDef):
-                # Get methods within class
                 for item in node.body:
                     if isinstance(item, ast.FunctionDef):
                         method_lines = code.split('\n')[item.lineno - 1:item.end_lineno]
@@ -140,17 +147,9 @@ class CodeParser:
 
         return functions
 
-    @staticmethod
-    def find_function_at_line(functions: List[Dict], line_num: int) -> Optional[Dict]:
-        """Find which function contains a given line number"""
-        for func in functions:
-            if func['line_start'] <= line_num <= func['line_end']:
-                return func
-        return None
 
-
-class MRCodeReviewer:
-    """Review only changed code in a merge request"""
+class DiffReviewer:
+    """Review uncommitted changes on current branch"""
 
     def __init__(self, config: ReviewConfig):
         self.config = config
@@ -170,7 +169,7 @@ class MRCodeReviewer:
             base_url=config.ollama_host
         )
 
-        # Initialize VectorStores (contains old/main branch code)
+        # Initialize VectorStores (contains committed code)
         print(f"📚 Loading vectorstores from {config.persist_dir}")
         self.bot_vectorstore = Chroma(
             collection_name=config.bot_collection_name,
@@ -185,45 +184,41 @@ class MRCodeReviewer:
         )
 
         # Initialize git parser
-        self.git_parser = GitDiffParser(
-            config.base_branch,
-            config.compare_branch,
-            config.bot_path
-        )
-
+        self.git_parser = GitDiffParser(config.bot_path)
         self.code_parser = CodeParser()
 
-    def get_old_function_code(self, file_path: str, function_name: str) -> Optional[str]:
-        """Get old version of function from ChromaDB"""
-        # Query vectorstore for this specific function
-        results = self.bot_vectorstore.similarity_search(
-            query=f"function {function_name} in {file_path}",
-            k=10,
-            filter={"filename": Path(file_path).name}
-        )
+    def get_old_function_from_git(self, file_path: str, function_name: str) -> Optional[str]:
+        """Get old version of function from git HEAD"""
+        old_file_content = self.git_parser.get_old_file_content(file_path)
 
-        # Find the matching function by name
-        for doc in results:
-            if function_name in doc.page_content:
-                # Try to extract just this function
-                # (ChromaDB might have the full function or a chunk)
-                if f"def {function_name}" in doc.page_content:
-                    return doc.page_content
+        if not old_file_content:
+            return None
+
+        old_functions = self.code_parser.parse_functions(old_file_content)
+
+        for func in old_functions:
+            if func['name'] == function_name:
+                return func['code']
 
         return None
 
     def get_new_function_code(self, file_path: str) -> str:
-        """Get new version of file from filesystem"""
+        """Get new version of file from working directory"""
         full_path = self.bot_path / file_path
         with open(full_path, 'r') as f:
             return f.read()
 
     def identify_changed_functions(self) -> List[ChangedFunction]:
-        """Identify all functions that changed in the diff"""
+        """Identify all functions that changed in working directory"""
         changed_functions = []
 
         # Get changed files
         changed_files = self.git_parser.get_changed_files()
+
+        if not changed_files:
+            print("\n✅ No uncommitted changes found!")
+            return []
+
         print(f"\n📝 Found {len(changed_files)} changed files:")
         for f in changed_files:
             print(f"  - {f}")
@@ -234,7 +229,7 @@ class MRCodeReviewer:
             # Get changed line ranges
             changed_ranges = self.git_parser.get_changed_line_ranges(file_path)
 
-            # Get new version of file
+            # Get new version from working directory
             try:
                 new_code = self.get_new_function_code(file_path)
             except FileNotFoundError:
@@ -244,43 +239,50 @@ class MRCodeReviewer:
             # Parse functions in new version
             new_functions = self.code_parser.parse_functions(new_code)
 
-            # Find which functions were affected by changes
+            # Get old version from git HEAD
+            old_code = self.git_parser.get_old_file_content(file_path)
+            old_functions = self.code_parser.parse_functions(old_code) if old_code else []
+
+            # Build old functions dict
+            old_funcs_dict = {f['name']: f for f in old_functions}
+
+            # Find affected functions
             affected_functions = set()
             for start, end in changed_ranges:
                 for func in new_functions:
-                    # Check if change overlaps with function
                     if not (end < func['line_start'] or start > func['line_end']):
                         affected_functions.add(func['name'])
 
             print(f"  📌 {len(affected_functions)} functions affected: {', '.join(affected_functions)}")
 
-            # For each affected function, get old and new versions
+            # Compare each affected function
             for func_name in affected_functions:
-                # Get new version
                 new_func = next((f for f in new_functions if f['name'] == func_name), None)
 
                 if not new_func:
                     continue
 
-                # Get old version from ChromaDB
-                old_code = self.get_old_function_code(file_path, func_name)
+                # Get old version
+                old_func = old_funcs_dict.get(func_name)
 
                 # Determine change type
-                if old_code is None:
+                if old_func is None:
                     change_type = "added"
+                    old_code_str = None
                     print(f"    ✨ {func_name}: NEW function")
-                elif old_code.strip() == new_func['code'].strip():
-                    # Code is the same, probably just line numbers shifted
+                elif old_func['code'].strip() == new_func['code'].strip():
+                    # Same code, skip
                     continue
                 else:
                     change_type = "modified"
+                    old_code_str = old_func['code']
                     print(f"    ✏️  {func_name}: MODIFIED")
 
                 changed_functions.append(ChangedFunction(
                     file_path=file_path,
                     function_name=func_name,
                     change_type=change_type,
-                    old_code=old_code,
+                    old_code=old_code_str,
                     new_code=new_func['code'],
                     line_start=new_func['line_start'],
                     line_end=new_func['line_end']
@@ -313,12 +315,12 @@ class MRCodeReviewer:
             filter={"filename": {"$ne": Path(changed_func.file_path).name}}
         )
 
-        # Build review prompt based on change type
+        # Build review prompt
         if changed_func.change_type == "added":
             prompt = self._build_new_function_prompt(
                 changed_func, usage_context, codebase_patterns, similar_in_bot
             )
-        else:  # modified
+        else:
             prompt = self._build_modified_function_prompt(
                 changed_func, usage_context, codebase_patterns, similar_in_bot
             )
@@ -337,9 +339,8 @@ class MRCodeReviewer:
 
     def _build_new_function_prompt(self, func: ChangedFunction,
                                    usage, patterns, similar) -> str:
-        """Build prompt for reviewing new function"""
         template = PromptTemplate(
-            template="""You are reviewing a NEW function added in a merge request.
+            template="""Review this NEW function in uncommitted changes.
 
 FILE: {file_path}
 FUNCTION: {function_name} (lines {line_start}-{line_end})
@@ -347,27 +348,26 @@ FUNCTION: {function_name} (lines {line_start}-{line_end})
 NEW CODE:
 {new_code}
 
-WHERE IT'S USED (if anywhere):
+WHERE IT'S USED:
 {usage}
 
 SIMILAR PATTERNS IN CODEBASE:
 {patterns}
 
-SIMILAR CODE IN BOT (possible duplication):
+SIMILAR CODE IN BOT:
 {similar}
 
-Review this new function for:
-1. Is it actually used/called anywhere? (orphan check)
-2. Does similar functionality already exist? (duplication)
-3. Error handling and validation
-4. Security concerns
-5. Follows best practices from codebase?
-6. Type hints and documentation
+Review:
+1. Is it used anywhere? (orphan check)
+2. Duplicates existing code?
+3. Error handling
+4. Security issues
+5. Follows best practices?
 
-Format: Concise bullet points. Only mention actual issues.
+Concise bullet points only.
 """,
             input_variables=["file_path", "function_name", "line_start", "line_end",
-                             "new_code", "usage", "patterns", "similar"]
+                           "new_code", "usage", "patterns", "similar"]
         )
 
         return template.format(
@@ -382,18 +382,17 @@ Format: Concise bullet points. Only mention actual issues.
         )
 
     def _build_modified_function_prompt(self, func: ChangedFunction,
-                                        usage, patterns, similar) -> str:
-        """Build prompt for reviewing modified function"""
+                                       usage, patterns, similar) -> str:
         template = PromptTemplate(
-            template="""You are reviewing a MODIFIED function in a merge request.
+            template="""Review this MODIFIED function in uncommitted changes.
 
 FILE: {file_path}
 FUNCTION: {function_name} (lines {line_start}-{line_end})
 
-OLD CODE (from main branch):
+OLD CODE (HEAD):
 {old_code}
 
-NEW CODE (in this MR):
+NEW CODE (Working Directory):
 {new_code}
 
 WHERE IT'S USED:
@@ -402,21 +401,17 @@ WHERE IT'S USED:
 SIMILAR PATTERNS IN CODEBASE:
 {patterns}
 
-SIMILAR CODE IN BOT:
-{similar}
-
 Review the changes:
-1. What changed and why might it have changed?
-2. Does the change break existing callers?
-3. Are new vulnerabilities introduced?
-4. Is error handling improved or degraded?
-5. Better patterns available in codebase?
-6. Any side effects on dependent code?
+1. What changed?
+2. Breaks existing callers?
+3. New vulnerabilities?
+4. Error handling better or worse?
+5. Better patterns in codebase?
 
-Format: Concise bullet points. Only mention actual issues or improvements.
+Concise bullet points only.
 """,
             input_variables=["file_path", "function_name", "line_start", "line_end",
-                             "old_code", "new_code", "usage", "patterns", "similar"]
+                           "old_code", "new_code", "usage", "patterns"]
         )
 
         return template.format(
@@ -424,31 +419,27 @@ Format: Concise bullet points. Only mention actual issues or improvements.
             function_name=func.function_name,
             line_start=func.line_start,
             line_end=func.line_end,
-            old_code=func.old_code or "Not found in ChromaDB",
+            old_code=func.old_code or "Not found",
             new_code=func.new_code,
-            usage="\n".join([d.page_content[:200] for d in usage[:2]]) if usage else "Not found",
-            patterns="\n---\n".join([d.page_content[:300] for d in patterns[:2]]) if patterns else "None",
-            similar="\n---\n".join([d.page_content[:200] for d in similar[:2]]) if similar else "None"
+            usage="\n".join([d.page_content[:200] for d in usage[:2]]) if usage else "None",
+            patterns="\n---\n".join([d.page_content[:300] for d in patterns[:2]]) if patterns else "None"
         )
 
-    def review_merge_request(self) -> List[Dict]:
-        """Main entry point: review all changes in MR"""
-        print("=" * 80)
-        print("🔍 MERGE REQUEST CODE REVIEW")
-        print("=" * 80)
-        print(f"Base: {self.config.base_branch}")
-        print(f"Compare: {self.config.compare_branch}")
+    def review_current_changes(self) -> List[Dict]:
+        """Review uncommitted changes in working directory"""
+        print("="*80)
+        print("🔍 REVIEWING UNCOMMITTED CHANGES")
+        print("="*80)
 
         # Identify changed functions
         changed_functions = self.identify_changed_functions()
 
         if not changed_functions:
-            print("\n✅ No functions changed - nothing to review!")
             return []
 
         print(f"\n📊 Total functions to review: {len(changed_functions)}\n")
 
-        # Review each changed function
+        # Review each
         reviews = []
         for func in changed_functions:
             review = self.review_changed_function(func)
@@ -456,13 +447,13 @@ Format: Concise bullet points. Only mention actual issues or improvements.
 
         return reviews
 
-    def generate_mr_report(self, reviews: List[Dict]) -> str:
-        """Generate MR-friendly report"""
+    def generate_report(self, reviews: List[Dict]) -> str:
+        """Generate review report"""
         if not reviews:
-            return "✅ No issues found - all changes look good!"
+            return "✅ No changes to review!"
 
         report = []
-        report.append("# 🤖 Code Review Summary\n")
+        report.append("# 🤖 Code Review - Uncommitted Changes\n")
 
         # Group by file
         by_file = {}
@@ -472,14 +463,12 @@ Format: Concise bullet points. Only mention actual issues or improvements.
                 by_file[file] = []
             by_file[file].append(review)
 
-        # Generate report per file
         for file_path, file_reviews in by_file.items():
             report.append(f"## 📄 {file_path}\n")
 
             for rev in file_reviews:
                 change_icon = "✨" if rev['change_type'] == "added" else "✏️"
-                report.append(
-                    f"### {change_icon} `{rev['function']}()` (lines {rev['line_start']}-{rev['line_end']})\n")
+                report.append(f"### {change_icon} `{rev['function']}()` (lines {rev['line_start']}-{rev['line_end']})\n")
                 report.append(f"**Change Type:** {rev['change_type'].title()}\n")
                 report.append(f"{rev['review']}\n")
                 report.append("---\n")
@@ -488,35 +477,33 @@ Format: Concise bullet points. Only mention actual issues or improvements.
 
 
 def main():
-    """Main execution"""
+    """Review uncommitted changes on current branch"""
     config = ReviewConfig(
         bot_path="./rpa_bot",
         persist_dir="./chroma_db",
-        base_branch="main",
-        compare_branch="HEAD",  # or "feature/add-validation"
         chat_model="py-chat",
         embed_model="py-embed"
     )
 
-    reviewer = MRCodeReviewer(config)
+    reviewer = DiffReviewer(config)
 
-    # Review the MR
-    reviews = reviewer.review_merge_request()
+    # Review current uncommitted changes
+    reviews = reviewer.review_current_changes()
 
     # Generate report
-    report = reviewer.generate_mr_report(reviews)
+    report = reviewer.generate_report(reviews)
 
     # Display
-    print("\n" + "=" * 80)
+    print("\n" + "="*80)
     print("📋 REVIEW REPORT")
-    print("=" * 80)
+    print("="*80)
     print(report)
 
-    # Save to file
-    with open("mr_review.md", "w") as f:
+    # Save
+    with open("diff_review.md", "w") as f:
         f.write(report)
 
-    print("\n✅ Review saved to mr_review.md")
+    print("\n✅ Review saved to diff_review.md")
 
 
 if __name__ == "__main__":
