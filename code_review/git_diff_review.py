@@ -1,16 +1,13 @@
 """
-Git Diff Code Reviewer with Functional Duplication Detection
-Reviews uncommitted changes on current branch
-Detects functional duplicates, risks, and confidential data exposure
+LLM-Driven Code Reviewer
+Uses LLM to understand functionality, not regex pattern matching
 """
 import subprocess
-import re
 import ast
-import hashlib
+import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
-from collections import Counter
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_community.vectorstores import Chroma
@@ -21,7 +18,6 @@ from langchain.prompts import PromptTemplate
 
 @dataclass
 class ReviewConfig:
-    """Configuration for diff reviewer"""
     bot_path: str = "./rpa_bot"
     codebase_path: str = "./rpa_codebase"
     persist_dir: str = "./chroma_db"
@@ -30,15 +26,15 @@ class ReviewConfig:
     ollama_host: str = "http://localhost:11434"
     chat_model: str = "py-chat"
     embed_model: str = "py-embed"
-    functional_similarity_threshold: float = 0.7  # 70% similar = duplicate
+    comparison_mode: str = "uncommitted"
+    base_branch: str = "main"
 
 
 @dataclass
 class ChangedFunction:
-    """Represents a function that changed"""
     file_path: str
     function_name: str
-    change_type: str  # "added", "modified", "deleted"
+    change_type: str
     old_code: Optional[str]
     new_code: Optional[str]
     line_start: int
@@ -46,279 +42,161 @@ class ChangedFunction:
 
 
 @dataclass
-class FunctionalDuplicate:
-    """Represents a functionally duplicate function"""
+class FunctionAnalysis:
+    """LLM's understanding of what a function does"""
+    purpose: str  # What does it do?
+    operations: List[str]  # What operations does it perform?
+    inputs: str  # What does it need?
+    outputs: str  # What does it produce?
+    risks: List[str]  # What could go wrong?
+    summary: str  # One-line summary
+
+
+@dataclass
+class DuplicationFinding:
     function_name: str
     file_path: str
     source: str  # "bot" or "codebase"
-    similarity_score: float
-    reasons: List[str]
+    similarity_explanation: str
+    recommendation: str
     code_snippet: str
 
 
-class RiskDetector:
-    """Detect security and reliability risks"""
+class LLMFunctionAnalyzer:
+    """Use LLM to deeply understand what a function does"""
 
-    RISK_PATTERNS = {
-        'sql_injection': [
-            (r'execute\s*\(\s*["\'].*%s.*["\']', 'String formatting in SQL query'),
-            (r'execute\s*\(\s*f["\']', 'F-string in SQL query'),
-            (r'\.format\s*\(.*\).*execute', 'Format in SQL query'),
-        ],
-        'command_injection': [
-            (r'os\.system\s*\(', 'os.system() call'),
-            (r'subprocess\.(call|run|Popen).*shell=True', 'subprocess with shell=True'),
-        ],
-        'hardcoded_credentials': [
-            (r'password\s*=\s*["\'][^"\']{3,}["\']', 'Hardcoded password'),
-            (r'api_key\s*=\s*["\'][^"\']{10,}["\']', 'Hardcoded API key'),
-            (r'secret\s*=\s*["\'][^"\']{3,}["\']', 'Hardcoded secret'),
-        ],
-        'resource_leak': [
-            (r'open\s*\([^)]+\)', 'File operation'),  # We'll check context separately
-        ],
-        'dangerous_functions': [
-            (r'\beval\s*\(', 'eval() usage'),
-            (r'\bexec\s*\(', 'exec() usage'),
-        ],
-        'error_handling': [
-            (r'except\s*:\s*$', 'Bare except clause'),
-            (r'except\s+Exception\s*:\s*pass', 'Exception swallowed silently'),
-        ]
-    }
-
-    @classmethod
-    def detect(cls, code: str) -> Dict[str, List[Dict]]:
-        """Detect all risks in code"""
-        findings = {}
-
-        for risk_type, patterns in cls.RISK_PATTERNS.items():
-            matches = []
-            for pattern, description in patterns:
-                for match in re.finditer(pattern, code, re.IGNORECASE | re.MULTILINE):
-                    line_num = code[:match.start()].count('\n') + 1
-
-                    # Special handling for resource_leak
-                    if risk_type == 'resource_leak':
-                        # Check if 'with' is nearby (context manager)
-                        context_start = max(0, match.start() - 100)
-                        context = code[context_start:match.end() + 20]
-
-                        # Skip if using context manager
-                        if 'with' in context and 'as' in context:
-                            continue
-
-                    matches.append({
-                        'line': line_num,
-                        'description': description,
-                        'code': match.group(0)[:50]
-                    })
-
-            if matches:
-                findings[risk_type] = matches
-
-        return findings
-
-
-class ConfidentialDataScanner:
-    """Scan for exposed confidential data"""
-
-    PATTERNS = {
-        'password': [
-            (r'password\s*=\s*["\']([^"\']{3,})["\']', 'Hardcoded password'),
-        ],
-        'api_key': [
-            (r'api[_-]?key\s*=\s*["\']([^"\']{10,})["\']', 'API key'),
-        ],
-        'database_url': [
-            (r'(postgresql|mysql)://[^"\'\s]+', 'Database connection string'),
-        ],
-        'email': [
-            (r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', 'Email address'),
-        ],
-        'ip_address': [
-            (r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', 'IP address'),
-        ]
-    }
-
-    SAFE_PATTERNS = [
-        r'os\.environ', r'getenv', r'config\.',
-        r'example\.com', r'localhost', r'127\.0\.0\.1',
-        r'YOUR_.*_HERE', r'<.*>', r'\.\.\.', r'xxx'
-    ]
-
-    @classmethod
-    def scan(cls, code: str) -> Dict[str, List[Dict]]:
-        """Scan for confidential data"""
-        findings = {}
-
-        for data_type, patterns in cls.PATTERNS.items():
-            matches = []
-            for pattern, description in patterns:
-                for match in re.finditer(pattern, code, re.IGNORECASE):
-                    # Check if this is a safe pattern (env var, config, placeholder)
-                    context = code[max(0, match.start()-100):match.end()+50]
-                    if any(re.search(safe, context) for safe in cls.SAFE_PATTERNS):
-                        continue
-
-                    value = match.group(1) if match.groups() else match.group(0)
-                    line_num = code[:match.start()].count('\n') + 1
-
-                    matches.append({
-                        'line': line_num,
-                        'description': description,
-                        'value_preview': value[:20] + '***'
-                    })
-
-            if matches:
-                findings[data_type] = matches
-
-        return findings
-
-
-class FunctionalAnalyzer:
-    """Analyze what a function does (not how it does it)"""
-
-    # Map of operations to keywords
-    OPERATION_KEYWORDS = {
-        'excel_read': ['read_excel', 'load_workbook', 'openpyxl', 'xlrd', 'ExcelFile'],
-        'excel_write': ['to_excel', 'save_workbook', 'ExcelWriter'],
-        'csv_read': ['read_csv', 'csv.reader', 'DictReader'],
-        'csv_write': ['to_csv', 'csv.writer', 'DictWriter'],
-        'database_read': ['select', 'query', 'fetchall', 'fetchone'],
-        'database_write': ['insert', 'update', 'delete', 'commit'],
-        'database_transaction': ['begin', 'commit', 'rollback', 'transaction'],
-        'api_call': ['requests.get', 'requests.post', 'http.client', 'urllib'],
-        'web_scraping': ['BeautifulSoup', 'soup.find', 'selenium', 'webdriver'],
-        'web_automation': ['selenium', 'webdriver', 'click()', 'send_keys'],
-        'authentication': ['login', 'authenticate', 'auth', 'credentials'],
-        'validation': ['validate', 'check', 'verify', 'assert', 'isinstance'],
-        'data_transformation': ['transform', 'convert', 'parse', 'normalize'],
-        'file_read': ['open(', 'read()', 'readlines'],
-        'file_write': ['write()', 'writelines', 'dump'],
-        'email': ['smtplib', 'send_mail', 'EmailMessage'],
-        'pdf': ['pypdf', 'reportlab', 'pdfplumber'],
-        'logging': ['logger.', 'logging.', 'log.'],
-        'error_handling': ['try:', 'except', 'raise', 'finally'],
-    }
-
-    @staticmethod
-    def extract_operations(code: str) -> Set[str]:
-        """Extract what operations this code performs"""
-        operations = set()
-        code_lower = code.lower()
-
-        for operation, keywords in FunctionalAnalyzer.OPERATION_KEYWORDS.items():
-            if any(kw.lower() in code_lower for kw in keywords):
-                operations.add(operation)
-
-        return operations
-
-    @staticmethod
-    def extract_imports(code: str) -> Set[str]:
-        """Extract imported libraries"""
-        imports = set()
-
-        # Match: import pandas, from pandas import ...
-        for match in re.finditer(r'(?:^|\n)\s*(?:import|from)\s+(\w+)', code):
-            imports.add(match.group(1))
-
-        return imports
-
-    @staticmethod
-    def extract_function_name_keywords(func_name: str) -> Set[str]:
-        """Extract meaningful keywords from function name"""
-        # Split by underscore and camelCase
-        parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', func_name)
-        parts.extend(func_name.split('_'))
-
-        # Filter out common words
-        common = {'get', 'set', 'do', 'make', 'run', 'execute', 'process', 'handle'}
-        keywords = {p.lower() for p in parts if p.lower() not in common and len(p) > 2}
-
-        return keywords
-
-
-class FunctionalDuplicationDetector:
-    """Detect when different code does the same thing"""
-
-    def __init__(self, llm, embeddings, bot_vectorstore, codebase_vectorstore,
-                 bot_path, codebase_path, threshold=0.7):
+    def __init__(self, llm, embeddings):
         self.llm = llm
         self.embeddings = embeddings
-        self.bot_vectorstore = bot_vectorstore
-        self.codebase_vectorstore = codebase_vectorstore
-        self.bot_path = Path(bot_path)
-        self.codebase_path = Path(codebase_path)
-        self.threshold = threshold
 
-        # Cache all functions from bot (for faster comparison)
-        self.bot_functions_cache = self._load_all_bot_functions()
+    def analyze_function(self, code: str, function_name: str) -> FunctionAnalysis:
+        """Ask LLM to analyze what this function does"""
 
-    def _load_all_bot_functions(self) -> List[Dict]:
-        """Load all functions from bot filesystem"""
-        all_functions = []
+        prompt = f"""Analyze this Python function and extract its PURPOSE and CHARACTERISTICS.
 
-        print("📦 Loading bot functions for comparison...", end=" ")
+FUNCTION: {function_name}
 
-        for py_file in self.bot_path.rglob("*.py"):
-            try:
-                with open(py_file, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
+CODE:
+{code}
 
-                functions = self._parse_functions(content)
-                for func in functions:
-                    func['file'] = str(py_file.relative_to(self.bot_path))
-                    func['operations'] = FunctionalAnalyzer.extract_operations(func['code'])
-                    func['imports'] = FunctionalAnalyzer.extract_imports(func['code'])
-                    all_functions.append(func)
-            except:
-                continue
+Provide a structured analysis:
 
-        print(f"✅ {len(all_functions)} functions loaded")
-        return all_functions
+1. PURPOSE (1 sentence): What problem does this solve? What is its goal?
 
-    def _parse_functions(self, code: str) -> List[Dict]:
-        """Parse functions from code using AST"""
-        try:
-            tree = ast.parse(code)
-        except:
-            return []
+2. OPERATIONS (bullet points): What specific operations does it perform?
+   - Reading files? (Excel, CSV, PDF, etc.)
+   - Database operations? (SELECT, INSERT, UPDATE)
+   - API calls?
+   - Data transformations?
+   - Validations?
+   - Web automation?
 
-        functions = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                func_lines = code.split('\n')[node.lineno - 1:node.end_lineno]
-                func_code = '\n'.join(func_lines)
+3. INPUTS: What data/parameters does it expect?
 
-                functions.append({
-                    'name': node.name,
-                    'line_start': node.lineno,
-                    'line_end': node.end_lineno,
-                    'code': func_code
-                })
+4. OUTPUTS: What does it produce/return?
 
-        return functions
+5. RISKS: What could go wrong? Security issues? Error handling problems?
 
-    def find_duplicates(self, new_code: str, new_name: str) -> Dict[str, List[FunctionalDuplicate]]:
-        """Find functional duplicates in both bot and codebase"""
+Format your response EXACTLY like this:
+PURPOSE: <one sentence>
+OPERATIONS:
+- <operation 1>
+- <operation 2>
+INPUTS: <description>
+OUTPUTS: <description>
+RISKS:
+- <risk 1>
+- <risk 2>
+"""
 
-        # Extract characteristics of new function
-        new_operations = FunctionalAnalyzer.extract_operations(new_code)
-        new_imports = FunctionalAnalyzer.extract_imports(new_code)
-        new_name_keywords = FunctionalAnalyzer.extract_function_name_keywords(new_name)
-        new_purpose = self._get_function_purpose(new_code)
+        response = self.llm.invoke(prompt)
 
-        # Find duplicates in bot
-        bot_duplicates = self._find_bot_duplicates(
-            new_code, new_name, new_operations, new_imports,
-            new_name_keywords, new_purpose
+        # Parse LLM response
+        return self._parse_analysis(response, code, function_name)
+
+    def _parse_analysis(self, llm_response: str, code: str, func_name: str) -> FunctionAnalysis:
+        """Parse LLM's structured response"""
+
+        lines = llm_response.split('\n')
+
+        purpose = ""
+        operations = []
+        inputs_desc = ""
+        outputs_desc = ""
+        risks = []
+
+        current_section = None
+
+        for line in lines:
+            line = line.strip()
+
+            if line.startswith('PURPOSE:'):
+                purpose = line.replace('PURPOSE:', '').strip()
+                current_section = None
+            elif line.startswith('OPERATIONS:'):
+                current_section = 'operations'
+            elif line.startswith('INPUTS:'):
+                inputs_desc = line.replace('INPUTS:', '').strip()
+                current_section = None
+            elif line.startswith('OUTPUTS:'):
+                outputs_desc = line.replace('OUTPUTS:', '').strip()
+                current_section = None
+            elif line.startswith('RISKS:'):
+                current_section = 'risks'
+            elif line.startswith('-') or line.startswith('•'):
+                item = line.lstrip('-•').strip()
+                if current_section == 'operations':
+                    operations.append(item)
+                elif current_section == 'risks':
+                    risks.append(item)
+
+        return FunctionAnalysis(
+            purpose=purpose or f"Function {func_name}",
+            operations=operations,
+            inputs=inputs_desc,
+            outputs=outputs_desc,
+            risks=risks,
+            summary=purpose[:100] if purpose else func_name
         )
 
-        # Find duplicates in codebase
-        codebase_duplicates = self._find_codebase_duplicates(
-            new_code, new_operations, new_imports,
-            new_name_keywords, new_purpose
+
+class LLMDuplicationDetector:
+    """Use LLM to detect functional duplicates"""
+
+    def __init__(self, llm, embeddings, analyzer, bot_vectorstore, codebase_vectorstore):
+        self.llm = llm
+        self.embeddings = embeddings
+        self.analyzer = analyzer
+        self.bot_vectorstore = bot_vectorstore
+        self.codebase_vectorstore = codebase_vectorstore
+
+    def find_duplicates(self, new_code: str, new_name: str,
+                       new_analysis: FunctionAnalysis) -> Dict[str, List[DuplicationFinding]]:
+        """Find functional duplicates using LLM understanding"""
+
+        print(f"    🔎 Searching for functional duplicates...")
+
+        # Step 1: Use analysis to search vectorstore intelligently
+        search_query = self._build_search_query(new_analysis)
+
+        # Step 2: Get candidates from both vectorstores
+        bot_candidates = self.bot_vectorstore.similarity_search(
+            query=search_query,
+            k=20
+        )
+
+        codebase_candidates = self.codebase_vectorstore.similarity_search(
+            query=search_query,
+            k=20
+        )
+
+        # Step 3: LLM compares new function to each candidate
+        bot_duplicates = self._compare_with_candidates(
+            new_code, new_name, new_analysis, bot_candidates, 'bot'
+        )
+
+        codebase_duplicates = self._compare_with_candidates(
+            new_code, new_name, new_analysis, codebase_candidates, 'codebase'
         )
 
         return {
@@ -326,231 +204,230 @@ class FunctionalDuplicationDetector:
             'codebase': codebase_duplicates
         }
 
-    def _find_bot_duplicates(self, new_code, new_name, new_ops, new_imports,
-                            new_keywords, new_purpose) -> List[FunctionalDuplicate]:
-        """Find duplicates in bot code"""
+    def _build_search_query(self, analysis: FunctionAnalysis) -> str:
+        """Build search query from function analysis"""
+        # Combine purpose and operations into a search query
+        query_parts = [analysis.purpose]
+        query_parts.extend(analysis.operations[:3])  # Top 3 operations
+        return " ".join(query_parts)
+
+    def _compare_with_candidates(self, new_code: str, new_name: str,
+                                 new_analysis: FunctionAnalysis,
+                                 candidates: List, source: str) -> List[DuplicationFinding]:
+        """Ask LLM to compare new function with each candidate"""
+
         duplicates = []
 
-        for func in self.bot_functions_cache:
-            # Skip self
-            if func['name'] == new_name:
+        for candidate in candidates[:10]:  # Limit to top 10
+            cand_name = candidate.metadata.get('element_name', 'unknown')
+            cand_file = candidate.metadata.get('filename', 'unknown')
+            cand_code = candidate.page_content
+
+            # Skip if same function name
+            if cand_name == new_name and source == 'bot':
                 continue
 
-            # Calculate similarity
-            score = self._calculate_similarity(
-                new_ops, new_imports, new_keywords, new_purpose,
-                func['operations'], func['imports'],
-                func['name'], func['code']
+            # Ask LLM: Are these functionally duplicate?
+            is_duplicate, explanation = self._llm_compare_functions(
+                new_code, new_name, new_analysis,
+                cand_code, cand_name
             )
 
-            if score >= self.threshold:
-                reasons = self._explain_similarity(
-                    new_ops, new_imports, new_keywords,
-                    func['operations'], func['imports'], func['name']
-                )
-
-                duplicates.append(FunctionalDuplicate(
-                    function_name=func['name'],
-                    file_path=func['file'],
-                    source='bot',
-                    similarity_score=score,
-                    reasons=reasons,
-                    code_snippet=func['code'][:200]
-                ))
-
-        return sorted(duplicates, key=lambda x: x.similarity_score, reverse=True)
-
-    def _find_codebase_duplicates(self, new_code, new_ops, new_imports,
-                                  new_keywords, new_purpose) -> List[FunctionalDuplicate]:
-        """Find duplicates in codebase using vectorstore"""
-        duplicates = []
-
-        # Strategy: Use vector search with full code
-        candidates = self.codebase_vectorstore.similarity_search(
-            query=new_code,  # FULL CODE, not just 500 chars
-            k=30  # Get more candidates
-        )
-
-        for candidate in candidates:
-            cand_code = candidate.page_content
-            cand_ops = FunctionalAnalyzer.extract_operations(cand_code)
-            cand_imports = FunctionalAnalyzer.extract_imports(cand_code)
-            cand_name = candidate.metadata.get('element_name', 'unknown')
-
-            score = self._calculate_similarity(
-                new_ops, new_imports, new_keywords, new_purpose,
-                cand_ops, cand_imports, cand_name, cand_code
-            )
-
-            if score >= self.threshold:
-                reasons = self._explain_similarity(
-                    new_ops, new_imports, new_keywords,
-                    cand_ops, cand_imports, cand_name
-                )
-
-                duplicates.append(FunctionalDuplicate(
+            if is_duplicate:
+                duplicates.append(DuplicationFinding(
                     function_name=cand_name,
-                    file_path=candidate.metadata.get('filename', 'unknown'),
-                    source='codebase',
-                    similarity_score=score,
-                    reasons=reasons,
-                    code_snippet=cand_code[:200]
+                    file_path=cand_file,
+                    source=source,
+                    similarity_explanation=explanation,
+                    recommendation=self._get_recommendation(source),
+                    code_snippet=cand_code[:300]
                 ))
 
-        return sorted(duplicates, key=lambda x: x.similarity_score, reverse=True)[:5]
+        return duplicates[:5]  # Return top 5
 
-    def _calculate_similarity(self, ops1, imports1, keywords1, purpose1,
-                             ops2, imports2, name2, code2) -> float:
-        """Calculate functional similarity score (0.0 to 1.0)"""
+    def _llm_compare_functions(self, code1: str, name1: str, analysis1: FunctionAnalysis,
+                               code2: str, name2: str) -> Tuple[bool, str]:
+        """Ask LLM if two functions are functionally duplicate"""
 
-        score = 0.0
+        prompt = f"""Compare these two functions and determine if they are FUNCTIONALLY DUPLICATE.
 
-        # 1. Operation overlap (40% weight) - MOST IMPORTANT
-        if ops1 and ops2:
-            ops_overlap = len(ops1 & ops2) / len(ops1 | ops2)
-            score += ops_overlap * 0.4
+Functionally duplicate means: They solve the same problem or perform the same core task, even if implemented differently.
 
-        # 2. Import overlap (20% weight)
-        if imports1 and imports2:
-            import_overlap = len(imports1 & imports2) / len(imports1 | imports2)
-            score += import_overlap * 0.2
+FUNCTION 1: {name1}
+Purpose: {analysis1.purpose}
+Operations: {', '.join(analysis1.operations)}
+Code snippet:
+{code1[:500]}
 
-        # 3. Function name keyword overlap (15% weight)
-        keywords2 = FunctionalAnalyzer.extract_function_name_keywords(name2)
-        if keywords1 and keywords2:
-            name_overlap = len(keywords1 & keywords2) / len(keywords1 | keywords2)
-            score += name_overlap * 0.15
+FUNCTION 2: {name2}
+Code:
+{code2[:500]}
 
-        # 4. Purpose semantic similarity (25% weight)
-        purpose2 = self._get_function_purpose(code2)
-        purpose_sim = self._semantic_similarity(purpose1, purpose2)
-        score += purpose_sim * 0.25
+Question: Are these two functions doing essentially the same thing?
 
-        return score
+Answer in this format:
+DUPLICATE: YES or NO
+EXPLANATION: <why they are or aren't duplicates>
+SIMILARITY: <percentage 0-100>
 
-    def _get_function_purpose(self, code: str) -> str:
-        """Get one-sentence purpose of function"""
-        # Extract docstring if available
-        docstring_match = re.search(r'"""(.+?)"""', code, re.DOTALL)
-        if docstring_match:
-            docstring = docstring_match.group(1).strip()
-            # Take first line
-            return docstring.split('\n')[0].strip()
+Examples:
+- Both read Excel files → YES, even if one uses openpyxl and one uses pandas
+- Both validate email format → YES, even if different regex
+- One reads Excel, one writes Excel → NO, different purposes
+- One validates user input, one validates database records → MAYBE (partial overlap)
+"""
 
-        # Fallback: ask LLM (cached would be ideal)
-        prompt = f"""What does this function do? Answer in ONE short sentence (max 10 words).
+        response = self.llm.invoke(prompt)
 
-{code[:800]}
+        # Parse response
+        is_duplicate = 'DUPLICATE: YES' in response.upper()
 
-Purpose:"""
+        # Extract explanation
+        explanation = ""
+        for line in response.split('\n'):
+            if line.startswith('EXPLANATION:'):
+                explanation = line.replace('EXPLANATION:', '').strip()
+                break
 
-        try:
-            purpose = self.llm.invoke(prompt).strip()
-            return purpose[:100]  # Limit length
-        except:
-            return ""
+        return is_duplicate, explanation or response[:200]
 
-    def _semantic_similarity(self, text1: str, text2: str) -> float:
-        """Calculate semantic similarity using embeddings"""
-        if not text1 or not text2:
-            return 0.0
+    def _get_recommendation(self, source: str) -> str:
+        """Get recommendation based on where duplicate was found"""
+        if source == 'bot':
+            return "Consider consolidating these functions to reduce code duplication"
+        else:
+            return "Consider using the codebase implementation instead of rewriting"
 
-        try:
-            emb1 = np.array(self.embeddings.embed_query(text1)).reshape(1, -1)
-            emb2 = np.array(self.embeddings.embed_query(text2)).reshape(1, -1)
 
-            sim = cosine_similarity(emb1, emb2)[0][0]
-            return float(sim)
-        except:
-            return 0.0
+class LLMCodeReviewer:
+    """Use LLM to review code for risks and issues"""
 
-    def _explain_similarity(self, ops1, imports1, keywords1,
-                           ops2, imports2, name2) -> List[str]:
-        """Explain why functions are similar"""
-        reasons = []
+    def __init__(self, llm):
+        self.llm = llm
 
-        # Operations overlap
-        common_ops = ops1 & ops2
-        if common_ops:
-            reasons.append(f"Both perform: {', '.join(common_ops)}")
+    def review_for_risks(self, code: str, function_name: str,
+                        analysis: FunctionAnalysis) -> Dict:
+        """Ask LLM to review for security and reliability risks"""
 
-        # Imports overlap
-        common_imports = imports1 & imports2
-        if common_imports:
-            reasons.append(f"Both use: {', '.join(common_imports)}")
+        prompt = f"""Review this function for SECURITY and RELIABILITY risks.
 
-        # Name keywords
-        keywords2 = FunctionalAnalyzer.extract_function_name_keywords(name2)
-        common_keywords = keywords1 & keywords2
-        if common_keywords:
-            reasons.append(f"Similar naming: {', '.join(common_keywords)}")
+FUNCTION: {function_name}
 
-        return reasons
+ANALYSIS:
+- Purpose: {analysis.purpose}
+- Operations: {', '.join(analysis.operations)}
+
+CODE:
+{code}
+
+Identify:
+1. SECURITY RISKS:
+   - SQL injection vulnerabilities
+   - Command injection
+   - Hardcoded credentials or secrets
+   - Unsafe file operations
+   - Path traversal risks
+
+2. RELIABILITY RISKS:
+   - Poor error handling
+   - Resource leaks (unclosed files, connections)
+   - Race conditions
+   - Infinite loop potential
+   - Missing validation
+
+3. CONFIDENTIAL DATA EXPOSURE:
+   - Hardcoded passwords, API keys, tokens
+   - Logged sensitive data
+   - Exposed connection strings
+
+Format response:
+SECURITY:
+- <issue and line reference>
+
+RELIABILITY:
+- <issue and line reference>
+
+CONFIDENTIAL:
+- <issue and line reference>
+
+If no issues, write "NONE" for that section.
+"""
+
+        response = self.llm.invoke(prompt)
+
+        return self._parse_review(response)
+
+    def _parse_review(self, llm_response: str) -> Dict:
+        """Parse LLM review into structured format"""
+
+        findings = {
+            'security': [],
+            'reliability': [],
+            'confidential': []
+        }
+
+        lines = llm_response.split('\n')
+        current_section = None
+
+        for line in lines:
+            line = line.strip()
+
+            if 'SECURITY:' in line.upper():
+                current_section = 'security'
+            elif 'RELIABILITY:' in line.upper():
+                current_section = 'reliability'
+            elif 'CONFIDENTIAL:' in line.upper():
+                current_section = 'confidential'
+            elif line.startswith('-') and current_section and 'NONE' not in line.upper():
+                findings[current_section].append(line.lstrip('-').strip())
+
+        return findings
 
 
 class GitDiffParser:
-    """Parse git diff for working directory changes"""
+    """Parse git diff"""
 
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, mode: str = "uncommitted", base_branch: str = "main"):
         self.repo_path = Path(repo_path)
+        self.mode = mode
+        self.base_branch = base_branch
 
     def get_changed_files(self) -> List[str]:
-        """Get changed Python files"""
+        if self.mode == "uncommitted":
+            cmd = ["git", "diff", "--name-only", "HEAD"]
+        elif self.mode == "staged":
+            cmd = ["git", "diff", "--name-only", "--cached"]
+        elif self.mode == "last-commit":
+            cmd = ["git", "diff", "--name-only", "HEAD~1", "HEAD"]
+        elif self.mode == "branch":
+            cmd = ["git", "diff", "--name-only", f"{self.base_branch}...HEAD"]
+        else:
+            cmd = ["git", "diff", "--name-only", "HEAD"]
+
         result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            cwd=self.repo_path,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace'
+            cmd, cwd=self.repo_path, capture_output=True,
+            text=True, encoding='utf-8', errors='replace'
         )
 
         files = result.stdout.strip().split('\n')
         return [f for f in files if f.endswith('.py') and f]
 
-    def get_changed_line_ranges(self, file_path: str) -> List[Tuple[int, int]]:
-        """Get changed line ranges"""
-        result = subprocess.run(
-            ["git", "diff", "--unified=0", "HEAD", "--", file_path],
-            cwd=self.repo_path,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace'
-        )
-
-        ranges = []
-        for line in result.stdout.split('\n'):
-            if line.startswith('@@'):
-                match = re.search(r'\+(\d+)(?:,(\d+))?', line)
-                if match:
-                    start = int(match.group(1))
-                    count = int(match.group(2)) if match.group(2) else 1
-                    end = start + count - 1
-                    ranges.append((start, end))
-
-        return ranges
-
     def get_old_file_content(self, file_path: str) -> Optional[str]:
-        """Get file from HEAD"""
-        result = subprocess.run(
-            ["git", "show", f"HEAD:{file_path}"],
-            cwd=self.repo_path,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace'
-        )
+        ref = "HEAD" if self.mode in ["uncommitted", "staged"] else "HEAD~1"
+        if self.mode == "branch":
+            ref = self.base_branch
 
+        result = subprocess.run(
+            ["git", "show", f"{ref}:{file_path}"],
+            cwd=self.repo_path, capture_output=True,
+            text=True, encoding='utf-8', errors='replace'
+        )
         return result.stdout if result.returncode == 0 else None
 
 
 class CodeParser:
-    """Parse Python code"""
-
     @staticmethod
     def parse_functions(code: str) -> List[Dict]:
-        """Extract all functions"""
         try:
             tree = ast.parse(code)
         except:
@@ -560,440 +437,193 @@ class CodeParser:
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef):
                 func_lines = code.split('\n')[node.lineno - 1:node.end_lineno]
-                func_code = '\n'.join(func_lines)
-
                 functions.append({
                     'name': node.name,
                     'line_start': node.lineno,
                     'line_end': node.end_lineno,
-                    'code': func_code
+                    'code': '\n'.join(func_lines)
                 })
-            elif isinstance(node, ast.ClassDef):
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
-                        method_lines = code.split('\n')[item.lineno - 1:item.end_lineno]
-                        method_code = '\n'.join(method_lines)
-
-                        functions.append({
-                            'name': f"{node.name}.{item.name}",
-                            'line_start': item.lineno,
-                            'line_end': item.end_lineno,
-                            'code': method_code
-                        })
-
         return functions
 
 
 class DiffReviewer:
-    """Review uncommitted changes with functional duplication detection"""
+    """LLM-driven code reviewer"""
 
     def __init__(self, config: ReviewConfig):
         self.config = config
         self.bot_path = Path(config.bot_path)
-        self.codebase_path = Path(config.codebase_path)
 
-        # Initialize LLM
         print(f"🤖 Initializing LLM: {config.chat_model}")
-        self.llm = Ollama(
-            model=config.chat_model,
-            base_url=config.ollama_host
-        )
+        self.llm = Ollama(model=config.chat_model, base_url=config.ollama_host)
 
-        # Initialize embeddings
         print(f"🔧 Initializing embeddings: {config.embed_model}")
-        self.embeddings = OllamaEmbeddings(
-            model=config.embed_model,
-            base_url=config.ollama_host
-        )
+        self.embeddings = OllamaEmbeddings(model=config.embed_model, base_url=config.ollama_host)
 
-        # Initialize VectorStores
-        print(f"📚 Loading vectorstores from {config.persist_dir}")
+        print(f"📚 Loading vectorstores")
         self.bot_vectorstore = Chroma(
             collection_name=config.bot_collection_name,
             embedding_function=self.embeddings,
             persist_directory=config.persist_dir
         )
-
         self.codebase_vectorstore = Chroma(
             collection_name=config.codebase_collection_name,
             embedding_function=self.embeddings,
             persist_directory=config.persist_dir
         )
 
-        # Initialize analyzers
-        self.git_parser = GitDiffParser(config.bot_path)
+        self.git_parser = GitDiffParser(config.bot_path, config.comparison_mode, config.base_branch)
         self.code_parser = CodeParser()
 
-        # Initialize functional duplication detector
-        self.dup_detector = FunctionalDuplicationDetector(
-            llm=self.llm,
-            embeddings=self.embeddings,
-            bot_vectorstore=self.bot_vectorstore,
-            codebase_vectorstore=self.codebase_vectorstore,
-            bot_path=config.bot_path,
-            codebase_path=config.codebase_path,
-            threshold=config.functional_similarity_threshold
+        # LLM-driven analyzers
+        self.function_analyzer = LLMFunctionAnalyzer(self.llm, self.embeddings)
+        self.dup_detector = LLMDuplicationDetector(
+            self.llm, self.embeddings, self.function_analyzer,
+            self.bot_vectorstore, self.codebase_vectorstore
+        )
+        self.code_reviewer = LLMCodeReviewer(self.llm)
+
+    def review_function(self, func: ChangedFunction) -> Dict:
+        """Review a single function using LLM"""
+
+        print(f"\n  🔬 Reviewing: {func.function_name}")
+
+        # Step 1: LLM analyzes what this function does
+        print(f"    🧠 LLM analyzing function purpose...")
+        analysis = self.function_analyzer.analyze_function(func.new_code, func.function_name)
+        print(f"       Purpose: {analysis.purpose}")
+
+        # Step 2: LLM finds functional duplicates
+        duplicates = self.dup_detector.find_duplicates(
+            func.new_code, func.function_name, analysis
+        )
+        print(f"       Found {len(duplicates['bot'])} bot duplicates, {len(duplicates['codebase'])} codebase")
+
+        # Step 3: LLM reviews for risks
+        print(f"    🛡️  LLM reviewing for risks...")
+        risks = self.code_reviewer.review_for_risks(func.new_code, func.function_name, analysis)
+
+        # Step 4: Find usage
+        usage = self.bot_vectorstore.similarity_search(
+            query=f"{func.function_name} usage called",
+            k=5
         )
 
-    def identify_changed_functions(self) -> List[ChangedFunction]:
-        """Identify changed functions"""
-        changed_functions = []
+        return {
+            "file": func.file_path,
+            "function": func.function_name,
+            "line_start": func.line_start,
+            "analysis": analysis,
+            "duplicates": duplicates,
+            "risks": risks,
+            "usage": usage
+        }
+
+    def review_all_changes(self):
+        """Review all changed functions"""
+
+        print("="*80)
+        print("🔍 LLM-DRIVEN CODE REVIEW")
+        print("="*80)
 
         changed_files = self.git_parser.get_changed_files()
 
         if not changed_files:
-            print("\n✅ No uncommitted changes found!")
+            print("\n❌ No changed Python files found")
+            print(f"Mode: {self.config.comparison_mode}")
             return []
 
-        print(f"\n📝 Found {len(changed_files)} changed files:")
-        for f in changed_files:
-            print(f"  - {f}")
+        print(f"\n📝 Changed files: {', '.join(changed_files)}")
+
+        all_reviews = []
 
         for file_path in changed_files:
-            print(f"\n🔍 Analyzing {file_path}...")
-
-            changed_ranges = self.git_parser.get_changed_line_ranges(file_path)
-
-            try:
-                new_code = self._read_file(file_path)
-            except FileNotFoundError:
-                continue
-
-            new_functions = self.code_parser.parse_functions(new_code)
+            new_code = open(self.bot_path / file_path, 'r', encoding='utf-8', errors='replace').read()
+            new_funcs = self.code_parser.parse_functions(new_code)
 
             old_code = self.git_parser.get_old_file_content(file_path)
-            old_functions = self.code_parser.parse_functions(old_code) if old_code else []
-            old_funcs_dict = {f['name']: f for f in old_functions}
+            old_funcs = {f['name']: f for f in self.code_parser.parse_functions(old_code)} if old_code else {}
 
-            affected_functions = set()
-            for start, end in changed_ranges:
-                for func in new_functions:
-                    if not (end < func['line_start'] or start > func['line_end']):
-                        affected_functions.add(func['name'])
+            for func in new_funcs:
+                old = old_funcs.get(func['name'])
+                if old and old['code'] == func['code']:
+                    continue  # Unchanged
 
-            print(f"  📌 {len(affected_functions)} functions affected")
-
-            for func_name in affected_functions:
-                new_func = next((f for f in new_functions if f['name'] == func_name), None)
-                if not new_func:
-                    continue
-
-                old_func = old_funcs_dict.get(func_name)
-
-                if old_func is None:
-                    change_type = "added"
-                    old_code_str = None
-                    print(f"    ✨ {func_name}: NEW")
-                elif old_func['code'].strip() == new_func['code'].strip():
-                    continue
-                else:
-                    change_type = "modified"
-                    old_code_str = old_func['code']
-                    print(f"    ✏️  {func_name}: MODIFIED")
-
-                changed_functions.append(ChangedFunction(
+                changed_func = ChangedFunction(
                     file_path=file_path,
-                    function_name=func_name,
-                    change_type=change_type,
-                    old_code=old_code_str,
-                    new_code=new_func['code'],
-                    line_start=new_func['line_start'],
-                    line_end=new_func['line_end']
-                ))
-
-        return changed_functions
-
-    def _read_file(self, file_path: str) -> str:
-        """Read file from working directory"""
-        full_path = self.bot_path / file_path
-        with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-            return f.read()
-
-    def review_changed_function(self, changed_func: ChangedFunction) -> Dict:
-        """Review a single changed function"""
-        print(f"  🔬 Reviewing {changed_func.function_name}...")
-
-        # 1. Detect risks
-        print(f"    🔍 Scanning for risks...", end=" ")
-        risks = RiskDetector.detect(changed_func.new_code)
-        print(f"{'⚠️ ' + str(len(risks)) + ' types' if risks else '✅'}")
-
-        # 2. Scan confidential data
-        print(f"    🔒 Scanning for confidential data...", end=" ")
-        confidential = ConfidentialDataScanner.scan(changed_func.new_code)
-        print(f"{'⚠️ ' + str(len(confidential)) + ' types' if confidential else '✅'}")
-
-        # 3. Find functional duplicates
-        print(f"    🔎 Detecting functional duplicates...", end=" ")
-        duplicates = self.dup_detector.find_duplicates(
-            changed_func.new_code,
-            changed_func.function_name
-        )
-        total_dups = len(duplicates['bot']) + len(duplicates['codebase'])
-        print(f"{'⚠️ ' + str(total_dups) + ' found' if total_dups else '✅'}")
-
-        # 4. Find usage
-        print(f"    📍 Finding usage...", end=" ")
-        usage = self.bot_vectorstore.similarity_search(
-            query=f"{changed_func.function_name} called invoke usage",
-            k=5
-        )
-        print(f"{'✅ ' + str(len(usage)) + ' places' if usage else '⚠️ Not used'}")
-
-        # 5. Generate LLM review
-        print(f"    🤖 Generating review...", end=" ")
-        llm_review = self._generate_llm_review(
-            changed_func, risks, confidential, duplicates, usage
-        )
-        print("✅")
-
-        return {
-            "file": changed_func.file_path,
-            "function": changed_func.function_name,
-            "line_start": changed_func.line_start,
-            "line_end": changed_func.line_end,
-            "change_type": changed_func.change_type,
-            "risks": risks,
-            "confidential_data": confidential,
-            "duplicates": duplicates,
-            "usage": usage,
-            "llm_review": llm_review
-        }
-
-    def _generate_llm_review(self, func, risks, confidential, duplicates, usage):
-        """Generate LLM review with all context"""
-
-        # Build automated findings
-        automated_findings = []
-
-        if risks:
-            automated_findings.append("🔴 SECURITY/RELIABILITY RISKS DETECTED:")
-            for risk_type, findings in risks.items():
-                automated_findings.append(f"  - {risk_type}: {len(findings)} issue(s)")
-
-        if confidential:
-            automated_findings.append("🔴 CONFIDENTIAL DATA EXPOSURE:")
-            for data_type, findings in confidential.items():
-                automated_findings.append(f"  - {data_type}: {len(findings)} instance(s)")
-
-        bot_dups = duplicates['bot']
-        if bot_dups:
-            automated_findings.append("🟡 FUNCTIONAL DUPLICATES IN BOT:")
-            for dup in bot_dups[:3]:
-                automated_findings.append(
-                    f"  - {dup.function_name} in {dup.file_path} "
-                    f"({dup.similarity_score*100:.0f}% similar)"
+                    function_name=func['name'],
+                    change_type="added" if not old else "modified",
+                    old_code=old['code'] if old else None,
+                    new_code=func['code'],
+                    line_start=func['line_start'],
+                    line_end=func['line_end']
                 )
-                for reason in dup.reasons:
-                    automated_findings.append(f"    • {reason}")
 
-        codebase_dups = duplicates['codebase']
-        if codebase_dups:
-            automated_findings.append("🟡 BETTER IMPLEMENTATIONS IN CODEBASE:")
-            for dup in codebase_dups[:3]:
-                automated_findings.append(
-                    f"  - {dup.function_name} in {dup.file_path} "
-                    f"({dup.similarity_score*100:.0f}% similar)"
-                )
-                for reason in dup.reasons:
-                    automated_findings.append(f"    • {reason}")
+                review = self.review_function(changed_func)
+                all_reviews.append(review)
 
-        if not usage:
-            automated_findings.append("🟡 USAGE WARNING: Function may not be called anywhere")
+        return all_reviews
 
-        automated_summary = "\n".join(automated_findings) if automated_findings else "✅ No automated issues detected"
+    def generate_report(self, reviews):
+        """Generate report"""
+        lines = ["# 🤖 LLM-Driven Code Review\n"]
 
-        # Build prompt
-        if func.change_type == "added":
-            prompt = f"""Review this NEW function:
+        for rev in reviews:
+            lines.append(f"## {rev['file']}: `{rev['function']}()` (lines {rev['line_start']}-{rev['line_end']})\n")
 
-FUNCTION: {func.function_name} (lines {func.line_start}-{func.line_end})
-FILE: {func.file_path}
+            lines.append(f"**Purpose:** {rev['analysis'].purpose}\n")
 
-CODE:
-{func.new_code}
+            if rev['duplicates']['bot']:
+                lines.append("### ⚠️ Duplicates in Bot\n")
+                for dup in rev['duplicates']['bot']:
+                    lines.append(f"- **{dup.function_name}** in {dup.file_path}")
+                    lines.append(f"  - {dup.similarity_explanation}")
+                    lines.append(f"  - {dup.recommendation}\n")
 
-AUTOMATED ANALYSIS:
-{automated_summary}
+            if rev['duplicates']['codebase']:
+                lines.append("### 💡 Better Implementation in Codebase\n")
+                for dup in rev['duplicates']['codebase']:
+                    lines.append(f"- **{dup.function_name}** in {dup.file_path}")
+                    lines.append(f"  - {dup.similarity_explanation}")
+                    lines.append(f"  - {dup.recommendation}\n")
 
-USAGE:
-{self._format_usage(usage)}
-
-Provide a concise review focusing on:
-1. Any issues not caught by automated analysis
-2. Code quality and best practices
-3. Recommendations
-
-Keep it brief and actionable."""
-
-        else:  # modified
-            prompt = f"""Review this MODIFIED function:
-
-FUNCTION: {func.function_name} (lines {func.line_start}-{func.line_end})
-FILE: {func.file_path}
-
-OLD CODE:
-{func.old_code[:500] if func.old_code else 'N/A'}
-
-NEW CODE:
-{func.new_code}
-
-AUTOMATED ANALYSIS:
-{automated_summary}
-
-Provide a concise review focusing on:
-1. What changed and why it matters
-2. Any issues not caught by automated analysis
-3. Impact on callers
-4. Recommendations
-
-Keep it brief and actionable."""
-
-        return self.llm.invoke(prompt)
-
-    def _format_usage(self, usage) -> str:
-        """Format usage results"""
-        if not usage:
-            return "⚠️ No usage found"
-
-        snippets = []
-        for doc in usage[:3]:
-            snippet = doc.page_content[:150].replace('\n', ' ')
-            snippets.append(f"- {snippet}...")
-
-        return "\n".join(snippets)
-
-    def review_current_changes(self) -> List[Dict]:
-        """Review all uncommitted changes"""
-        print("="*80)
-        print("🔍 REVIEWING UNCOMMITTED CHANGES")
-        print("="*80)
-
-        changed_functions = self.identify_changed_functions()
-
-        if not changed_functions:
-            return []
-
-        print(f"\n📊 Total functions to review: {len(changed_functions)}\n")
-
-        reviews = []
-        for func in changed_functions:
-            review = self.review_changed_function(func)
-            reviews.append(review)
-
-        return reviews
-
-    def generate_report(self, reviews: List[Dict]) -> str:
-        """Generate markdown report"""
-        if not reviews:
-            return "✅ No changes to review!"
-
-        lines = []
-        lines.append("# 🤖 Code Review - Uncommitted Changes\n")
-
-        # Statistics
-        total_risks = sum(len(r['risks']) for r in reviews)
-        total_confidential = sum(len(r['confidential_data']) for r in reviews)
-        total_bot_dups = sum(len(r['duplicates']['bot']) for r in reviews)
-        total_codebase_dups = sum(len(r['duplicates']['codebase']) for r in reviews)
-
-        lines.append("## 📊 Summary\n")
-        lines.append(f"- **Functions reviewed:** {len(reviews)}")
-        lines.append(f"- **Security/reliability risks:** {total_risks}")
-        lines.append(f"- **Confidential data exposures:** {total_confidential}")
-        lines.append(f"- **Duplicates in bot:** {total_bot_dups}")
-        lines.append(f"- **Better alternatives in codebase:** {total_codebase_dups}\n")
-
-        # Group by file
-        by_file = {}
-        for review in reviews:
-            file = review['file']
-            if file not in by_file:
-                by_file[file] = []
-            by_file[file].append(review)
-
-        # Per-file reviews
-        for file_path, file_reviews in by_file.items():
-            lines.append(f"## 📄 {file_path}\n")
-
-            for rev in file_reviews:
-                icon = "✨" if rev['change_type'] == "added" else "✏️"
-                lines.append(f"### {icon} `{rev['function']}()` (lines {rev['line_start']}-{rev['line_end']})\n")
-                lines.append(f"**Change Type:** {rev['change_type'].title()}\n")
-
-                # Risks
-                if rev['risks']:
-                    lines.append("#### 🔴 Security/Reliability Risks\n")
-                    for risk_type, findings in rev['risks'].items():
-                        lines.append(f"**{risk_type.replace('_', ' ').title()}:**")
-                        for finding in findings:
-                            lines.append(f"- Line {finding['line']}: {finding['description']}")
+            if any(rev['risks'].values()):
+                lines.append("### 🔴 Risks\n")
+                for risk_type, issues in rev['risks'].items():
+                    if issues:
+                        lines.append(f"**{risk_type.title()}:**")
+                        for issue in issues:
+                            lines.append(f"- {issue}")
                         lines.append("")
 
-                # Confidential data
-                if rev['confidential_data']:
-                    lines.append("#### 🔒 Confidential Data Exposure\n")
-                    for data_type, findings in rev['confidential_data'].items():
-                        lines.append(f"**{data_type.replace('_', ' ').title()}:**")
-                        for finding in findings:
-                            lines.append(f"- Line {finding['line']}: {finding['description']}")
-                        lines.append("")
-
-                # Duplicates
-                if rev['duplicates']['bot']:
-                    lines.append("#### 🟡 Functional Duplicates in Bot\n")
-                    for dup in rev['duplicates']['bot'][:3]:
-                        lines.append(f"**{dup.function_name}** in `{dup.file_path}` ({dup.similarity_score*100:.0f}% similar)")
-                        for reason in dup.reasons:
-                            lines.append(f"  - {reason}")
-                        lines.append("")
-
-                if rev['duplicates']['codebase']:
-                    lines.append("#### 💡 Better Implementations Available in Codebase\n")
-                    for dup in rev['duplicates']['codebase'][:3]:
-                        lines.append(f"**{dup.function_name}** in `{dup.file_path}` ({dup.similarity_score*100:.0f}% similar)")
-                        for reason in dup.reasons:
-                            lines.append(f"  - {reason}")
-                        lines.append("")
-
-                # LLM review
-                lines.append("#### 🤖 AI Review\n")
-                lines.append(rev['llm_review'])
-                lines.append("\n---\n")
+            lines.append("---\n")
 
         return "\n".join(lines)
 
 
 def main():
-    """Review uncommitted changes"""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="uncommitted")
+    parser.add_argument("--base", default="main")
+    args = parser.parse_args()
+
     config = ReviewConfig(
-        bot_path="./rpa_bot",
-        codebase_path="./rpa_codebase",
-        persist_dir="./chroma_db",
-        chat_model="py-chat",
-        embed_model="py-embed",
-        functional_similarity_threshold=0.7
+        comparison_mode=args.mode,
+        base_branch=args.base
     )
 
     reviewer = DiffReviewer(config)
+    reviews = reviewer.review_all_changes()
 
-    # Review
-    reviews = reviewer.review_current_changes()
+    if reviews:
+        report = reviewer.generate_report(reviews)
+        print("\n" + "="*80)
+        print(report)
 
-    # Generate report
-    report = reviewer.generate_report(reviews)
-
-    # Display
-    print("\n" + "="*80)
-    print("📋 REVIEW REPORT")
-    print("="*80)
-    print(report)
-
-    # Save
-    with open("diff_review.md", "w", encoding='utf-8') as f:
-        f.write(report)
-
-    print("\n✅ Review saved to diff_review.md")
+        with open("llm_review.md", "w") as f:
+            f.write(report)
+        print("\n✅ Saved to llm_review.md")
 
 
 if __name__ == "__main__":
