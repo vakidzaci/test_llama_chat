@@ -75,14 +75,14 @@ class RiskDetector:
             (r'secret\s*=\s*["\'][^"\']{3,}["\']', 'Hardcoded secret'),
         ],
         'resource_leak': [
-            (r'(?<!with\s.{0,50})open\s*\([^)]+\)(?!\s+as\s)', 'File opened without context manager'),
+            (r'open\s*\([^)]+\)', 'File operation'),  # We'll check context separately
         ],
         'dangerous_functions': [
             (r'\beval\s*\(', 'eval() usage'),
             (r'\bexec\s*\(', 'exec() usage'),
         ],
         'error_handling': [
-            (r'except\s*:\s*(?!.*raise)', 'Bare except without re-raise'),
+            (r'except\s*:\s*$', 'Bare except clause'),
             (r'except\s+Exception\s*:\s*pass', 'Exception swallowed silently'),
         ]
     }
@@ -97,6 +97,17 @@ class RiskDetector:
             for pattern, description in patterns:
                 for match in re.finditer(pattern, code, re.IGNORECASE | re.MULTILINE):
                     line_num = code[:match.start()].count('\n') + 1
+
+                    # Special handling for resource_leak
+                    if risk_type == 'resource_leak':
+                        # Check if 'with' is nearby (context manager)
+                        context_start = max(0, match.start() - 100)
+                        context = code[context_start:match.end() + 20]
+
+                        # Skip if using context manager
+                        if 'with' in context and 'as' in context:
+                            continue
+
                     matches.append({
                         'line': line_num,
                         'description': description,
